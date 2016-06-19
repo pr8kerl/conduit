@@ -1,0 +1,28 @@
+syntax = "proto3";
+ 
+package main;
+
+service ConduitAgent {
+  rpc Pull (Token) returns (stream Packet) {}
+}
+service ConduitServer {
+  rpc Push (stream Packet) returns (Token) {}
+}
+
+message Token {
+  string domain = 1;
+}
+
+message Packet {
+
+  enum PacketType {
+    LOG = 0;
+    EVENT = 1;
+    PERF = 2;
+  }
+
+  PacketType id = 1;
+  string msg = 2;
+  string source = 3;
+
+}
