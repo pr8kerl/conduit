@@ -18,17 +18,17 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"github.com/mitchellh/cli"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
-	//	"log"
-	//	"net"
-	"fmt"
+	"google.golang.org/grpc/grpclog"
 	"io"
-)
-
-const (
-	serverAddr = "127.0.0.1:6666"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
 )
 
 type ServerCommand struct {
@@ -43,6 +43,96 @@ func serverCmdFactory() (cli.Command, error) {
 			OutputColor: cli.UiColorGreen,
 		},
 	}, nil
+}
+
+type conduitAgentConnection struct {
+	addr     string
+	conn     *grpc.ClientConn
+	dopts    grpc.DialOption
+	shutdown chan bool
+}
+
+func newAgentConnection(hostname string, port int, shut chan bool) (c *conduitAgentConnection, err error) {
+	c = new(conduitAgentConnection)
+	portstr := fmt.Sprintf("%d", port)
+	c.addr = hostname + ":" + portstr
+	c.dopts = grpc.WithInsecure()
+	c.shutdown = shut
+	c.conn, err = grpc.Dial(c.addr, c.dopts)
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func (c *conduitAgentConnection) Poll() (err error) {
+
+	for {
+
+		select {
+		case <-c.shutdown:
+			// shutdown signal
+			grpclog.Printf("server: poll shutdown\n")
+			return nil
+		case <-time.After(time.Minute):
+			grpclog.Printf("server: poll timeout\n")
+			cagent := NewConduitAgentClient(c.conn)
+			stream, err := cagent.Pull(context.Background(), &Token{Domain: "localhost"})
+			if err != nil {
+				grpclog.Printf("error retrieving agent events: %s\n", err)
+			}
+			for {
+				paket, err := stream.Recv()
+				if err == io.EOF {
+					grpclog.Printf("eom\n")
+					break
+				}
+				if err != nil {
+					fmt.Printf("%v.Msg: %v", cagent, err)
+					return err
+				}
+				fmt.Println(paket.Msg)
+			}
+		}
+	}
+}
+
+type conduitServer struct {
+	sigs     chan os.Signal
+	shutdown chan bool
+	incoming chan []byte
+	wait     sync.WaitGroup
+	conn     grpc.ClientConn
+}
+
+func newServer() *conduitServer {
+	s := new(conduitServer)
+	s.sigs = make(chan os.Signal, 1)
+	s.shutdown = make(chan bool, 1)
+	s.incoming = make(chan []byte, 1024)
+	return s
+}
+
+func (c *conduitServer) SigHandler() {
+	defer c.wait.Done()
+	signal.Notify(c.sigs,
+		syscall.SIGTERM,
+		syscall.SIGQUIT)
+	sig := <-c.sigs
+	grpclog.Printf("signal received: %v\n", sig)
+	c.Stop()
+	return
+}
+
+func (c *conduitServer) Stop() {
+
+	c.shutdown <- true
+	c.conn.Close()
+	c.wait.Wait()
+
+	// Release all remaining resources.
+	c.shutdown = nil
+	c.incoming = nil
 }
 
 func (c *ServerCommand) Run(args []string) int {
@@ -61,31 +151,18 @@ func (c *ServerCommand) Run(args []string) int {
 
 	// pull channel
 
-	msg := "starting server " + version
-	c.Ui.Output(msg)
+	grpclog.Printf("starting server %s\n", version)
 
-	conn, err := grpc.Dial(serverAddr, grpc.WithInsecure())
+	server := newServer()
+	conn, err := newAgentConnection("127.0.0.1", 6666, server.shutdown)
 	if err != nil {
-		c.Ui.Output(fmt.Sprintf("error connecting to server: %s\n", err))
+		grpclog.Printf("error connecting to agent: %s\n", err)
 		return 1
 	}
-	defer conn.Close()
-	agent := NewConduitAgentClient(conn)
-	stream, err := agent.Pull(context.Background(), &Token{Domain: "localhost"})
-	if err != nil {
-		c.Ui.Output(fmt.Sprintf("error retrieving agent events: %s\n", err))
-	}
-	for {
-		paket, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			fmt.Printf("%v.Msg: %v", agent, err)
-			return 1
-		}
-		fmt.Println(paket.Msg)
-	}
+	server.wait.Add(2)
+	go server.SigHandler()
+	conn.Poll()
+	server.Stop()
 
 	return 0
 

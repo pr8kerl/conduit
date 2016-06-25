@@ -23,17 +23,20 @@ import (
 	"google.golang.org/grpc"
 	//	"log"
 	"net"
-	"time"
 	//	"google.golang.org/grpc/credentials"
-	"fmt"
+	"bufio"
+	"bytes"
+	"container/heap"
 	"google.golang.org/grpc/grpclog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 )
 
 const (
-	agentAddr = "127.0.0.1:6666"
+	agentAddr       = "127.0.0.1:6666"
+	MAX_UDP_PAYLOAD = 64 * 1024
 )
 
 type AgentCommand struct {
@@ -50,41 +53,158 @@ func agentCmdFactory() (cli.Command, error) {
 	}, nil
 }
 
+type PacketQ []*Packet
+
+func (q PacketQ) Len() int           { return len(q) }
+func (q PacketQ) Less(i, j int) bool { return i < j }
+func (q PacketQ) Swap(i, j int)      { q[i], q[j] = q[j], q[i] }
+
+func (q *PacketQ) Push(x interface{}) {
+	// Push and Pop use pointer receivers because they modify the slice's length,
+	// not just its contents.
+	*q = append(*q, x.(*Packet))
+}
+
+func (q *PacketQ) Pop() interface{} {
+	old := *q
+	n := len(old)
+	x := old[n-1]
+	*q = old[0 : n-1]
+	return x
+}
+
 type conduitAgentServer struct {
-	messages   []string
+	pktq       *PacketQ
+	msgmutex   *sync.Mutex
 	sigs       chan os.Signal
 	GrpcServer *grpc.Server
+	shutdown   chan bool
+	incoming   chan []byte
+	wait       sync.WaitGroup
+	conn       *net.UDPConn
+	addr       *net.UDPAddr
+}
+
+func newAgentServer() *conduitAgentServer {
+	a := new(conduitAgentServer)
+	a.msgmutex = &sync.Mutex{}
+	a.sigs = make(chan os.Signal, 1)
+	a.GrpcServer = grpc.NewServer()
+	a.shutdown = make(chan bool, 1)
+	a.incoming = make(chan []byte, 1024)
+	a.pktq = &PacketQ{}
+	heap.Init(a.pktq)
+	return a
 }
 
 func (c *conduitAgentServer) Pull(token *Token, stream ConduitAgent_PullServer) error {
-	grpclog.Printf("domain: %s\n", token.Domain)
-	for i := 0; i < 1024; i++ {
-		msg := fmt.Sprintf("msg: %d\n", i)
-		if err := stream.Send(&Packet{Id: 1, Msg: msg, Source: "module"}); err != nil {
+	grpclog.Printf("pulled: %s\n", token.Domain)
+	c.msgmutex.Lock()
+	for c.pktq.Len() > 0 {
+		pkt := heap.Pop(c.pktq).(*Packet)
+		grpclog.Printf("msg: %s\n", pkt.Msg)
+		if err := stream.Send(pkt); err != nil {
 			return err
 		}
-		time.Sleep(1 * time.Second)
 	}
+	c.msgmutex.Unlock()
 
 	return nil
 }
 
 func (c *conduitAgentServer) SigHandler() {
+	defer c.wait.Done()
 	signal.Notify(c.sigs,
 		syscall.SIGTERM,
 		syscall.SIGQUIT)
 	sig := <-c.sigs
 	grpclog.Printf("signal received: %v\n", sig)
-	c.GrpcServer.Stop()
+	c.Stop()
 	return
 }
 
-func newAgentServer() *conduitAgentServer {
-	a := new(conduitAgentServer)
-	a.messages = make([]string, 0, 1024)
-	a.sigs = make(chan os.Signal, 1)
-	a.GrpcServer = grpc.NewServer()
-	return a
+func (c *conduitAgentServer) Stop() {
+
+	if c.conn == nil {
+		grpclog.Printf("udp connection already closed.")
+	}
+
+	c.conn.Close()
+	c.shutdown <- true
+	c.wait.Wait()
+	c.GrpcServer.Stop()
+
+	// Release all remaining resources.
+	c.shutdown = nil
+	c.conn = nil
+}
+
+func (c *conduitAgentServer) ServeTelegraf() (err error) {
+	defer c.wait.Done()
+
+	c.addr, err = net.ResolveUDPAddr("udp", "127.0.0.1:8089")
+	if err != nil {
+		grpclog.Printf("error cannot resolve udp address: %s\n", err)
+		return
+	}
+
+	c.conn, err = net.ListenUDP("udp", c.addr)
+	if err != nil {
+		grpclog.Printf("error creating udp listener: %s\n", err)
+		return
+	}
+
+	err = c.conn.SetReadBuffer(MAX_UDP_PAYLOAD)
+	if err != nil {
+		grpclog.Printf("error setting udp read buffer: %s\n", err)
+		return
+	}
+
+	buf := make([]byte, MAX_UDP_PAYLOAD)
+	for {
+
+		select {
+		case <-c.shutdown:
+			// shutdown signal
+			return
+		default:
+			// read a message
+			i, _, err := c.conn.ReadFromUDP(buf)
+			if err != nil {
+				grpclog.Printf("error: could not read udp msg: %s\n", err)
+				continue
+			}
+
+			grpclog.Printf("telegraf listener read %d bytes\n", i)
+			bufbuf := make([]byte, i)
+			copy(bufbuf, buf[:i])
+			c.incoming <- bufbuf
+
+		}
+	}
+}
+
+func (c *conduitAgentServer) parseTelegraf() {
+
+	for {
+		select {
+		case <-c.shutdown:
+			return
+		case bites := <-c.incoming:
+
+			rdr := bytes.NewReader(bites)
+			scanner := bufio.NewScanner(rdr)
+			c.msgmutex.Lock()
+			for scanner.Scan() {
+				msg := scanner.Text()
+				pkt := &Packet{Id: 1, Msg: msg, Source: "telegraf"}
+				heap.Push(c.pktq, pkt)
+			}
+			c.msgmutex.Unlock()
+
+		}
+	}
+
 }
 
 func (c *AgentCommand) Run(args []string) int {
@@ -103,8 +223,7 @@ func (c *AgentCommand) Run(args []string) int {
 
 	// pull channel
 
-	msg := "starting agent " + version
-	c.Ui.Output(msg)
+	grpclog.Printf("starting agent %s\n", version)
 
 	lsnr, err := net.Listen("tcp", agentAddr)
 	if err != nil {
@@ -125,7 +244,10 @@ func (c *AgentCommand) Run(args []string) int {
 
 	agent := newAgentServer()
 	RegisterConduitAgentServer(agent.GrpcServer, agent)
+	agent.wait.Add(2)
 	go agent.SigHandler()
+	go agent.parseTelegraf()
+	go agent.ServeTelegraf()
 	agent.GrpcServer.Serve(lsnr)
 
 	return 0
