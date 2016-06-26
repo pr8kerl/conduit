@@ -53,19 +53,19 @@ func agentCmdFactory() (cli.Command, error) {
 	}, nil
 }
 
-type PacketQ []*Packet
+type TgrafQ []string
 
-func (q PacketQ) Len() int           { return len(q) }
-func (q PacketQ) Less(i, j int) bool { return i < j }
-func (q PacketQ) Swap(i, j int)      { q[i], q[j] = q[j], q[i] }
+func (q TgrafQ) Len() int           { return len(q) }
+func (q TgrafQ) Less(i, j int) bool { return i < j }
+func (q TgrafQ) Swap(i, j int)      { q[i], q[j] = q[j], q[i] }
 
-func (q *PacketQ) Push(x interface{}) {
+func (q *TgrafQ) Push(x interface{}) {
 	// Push and Pop use pointer receivers because they modify the slice's length,
 	// not just its contents.
-	*q = append(*q, x.(*Packet))
+	*q = append(*q, x.(string))
 }
 
-func (q *PacketQ) Pop() interface{} {
+func (q *TgrafQ) Pop() interface{} {
 	old := *q
 	n := len(old)
 	x := old[n-1]
@@ -74,7 +74,7 @@ func (q *PacketQ) Pop() interface{} {
 }
 
 type conduitAgentServer struct {
-	pktq       *PacketQ
+	tgrafq     *TgrafQ
 	msgmutex   *sync.Mutex
 	sigs       chan os.Signal
 	GrpcServer *grpc.Server
@@ -92,22 +92,24 @@ func newAgentServer() *conduitAgentServer {
 	a.GrpcServer = grpc.NewServer()
 	a.shutdown = make(chan bool, 1)
 	a.incoming = make(chan []byte, 1024)
-	a.pktq = &PacketQ{}
-	heap.Init(a.pktq)
+	a.tgrafq = &TgrafQ{}
+	heap.Init(a.tgrafq)
 	return a
 }
 
-func (c *conduitAgentServer) Pull(token *Token, stream ConduitAgent_PullServer) error {
-	grpclog.Printf("pulled: %s\n", token.Domain)
+func (c *conduitAgentServer) Pull(stream ConduitAgent_PullServer) error {
+	grpclog.Printf("pulled\n")
 	c.msgmutex.Lock()
-	for c.pktq.Len() > 0 {
-		pkt := heap.Pop(c.pktq).(*Packet)
-		grpclog.Printf("msg: %s\n", pkt.Msg)
-		if err := stream.Send(pkt); err != nil {
-			return err
-		}
+	msgs := make([]string, 0, c.tgrafq.Len())
+	for c.tgrafq.Len() > 0 {
+		msg := heap.Pop(c.tgrafq).(string)
+		msgs = append(msgs, msg)
 	}
 	c.msgmutex.Unlock()
+	pkt := &Packet{Id: 1, Msg: msgs, Source: "telegraf"}
+	if err := stream.Send(pkt); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -130,7 +132,7 @@ func (c *conduitAgentServer) Stop() {
 	}
 
 	c.conn.Close()
-	c.shutdown <- true
+	close(c.shutdown)
 	c.wait.Wait()
 	c.GrpcServer.Stop()
 
@@ -197,8 +199,7 @@ func (c *conduitAgentServer) parseTelegraf() {
 			c.msgmutex.Lock()
 			for scanner.Scan() {
 				msg := scanner.Text()
-				pkt := &Packet{Id: 1, Msg: msg, Source: "telegraf"}
-				heap.Push(c.pktq, pkt)
+				heap.Push(c.tgrafq, msg)
 			}
 			c.msgmutex.Unlock()
 

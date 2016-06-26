@@ -3,10 +3,10 @@ syntax = "proto3";
 package main;
 
 service ConduitAgent {
-  rpc Pull (Token) returns (stream Packet) {}
+  rpc Pull (stream Packet) returns (stream Packet) {}
 }
 service ConduitServer {
-  rpc Push (stream Packet) returns (Token) {}
+  rpc Push (stream Packet) returns (stream Packet) {}
 }
 
 message Token {
@@ -22,7 +22,7 @@ message Packet {
   }
 
   PacketType id = 1;
-  string msg = 2;
+  repeated string msg = 2;
   string source = 3;
 
 }

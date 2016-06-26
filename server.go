@@ -77,7 +77,7 @@ func (c *conduitAgentConnection) Poll() (err error) {
 		case <-time.After(time.Minute):
 			grpclog.Printf("server: poll timeout\n")
 			cagent := NewConduitAgentClient(c.conn)
-			stream, err := cagent.Pull(context.Background(), &Token{Domain: "localhost"})
+			stream, err := cagent.Pull(context.Background())
 			if err != nil {
 				grpclog.Printf("error retrieving agent events: %s\n", err)
 			}
@@ -88,10 +88,16 @@ func (c *conduitAgentConnection) Poll() (err error) {
 					break
 				}
 				if err != nil {
-					fmt.Printf("%v.Msg: %v", cagent, err)
+					fmt.Printf("error %v, %v\n", cagent, err)
 					return err
 				}
-				fmt.Println(paket.Msg)
+				msgs := paket.Msg
+				length := len(msgs)
+				for i, msg := range msgs {
+					fmt.Printf("%d msg: %s\n", i, msg)
+				}
+				fmt.Printf("%d msgs received in packet\n", length)
+
 			}
 		}
 	}
@@ -120,7 +126,6 @@ func (c *conduitServer) SigHandler() {
 		syscall.SIGQUIT)
 	sig := <-c.sigs
 	grpclog.Printf("signal received: %v\n", sig)
-	c.Stop()
 	return
 }
 
@@ -159,9 +164,10 @@ func (c *ServerCommand) Run(args []string) int {
 		grpclog.Printf("error connecting to agent: %s\n", err)
 		return 1
 	}
-	server.wait.Add(2)
+	server.wait.Add(1)
 	go server.SigHandler()
 	conn.Poll()
+	grpclog.Printf("server: Poll is finished\n")
 	server.Stop()
 
 	return 0

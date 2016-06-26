@@ -69,7 +69,7 @@ func (*Token) Descriptor() ([]byte, []int) { return fileDescriptor0, []int{0} }
 
 type Packet struct {
 	Id     Packet_PacketType `protobuf:"varint,1,opt,name=id,enum=main.Packet_PacketType" json:"id,omitempty"`
-	Msg    string            `protobuf:"bytes,2,opt,name=msg" json:"msg,omitempty"`
+	Msg    []string          `protobuf:"bytes,2,rep,name=msg" json:"msg,omitempty"`
 	Source string            `protobuf:"bytes,3,opt,name=source" json:"source,omitempty"`
 }
 
@@ -95,7 +95,7 @@ const _ = grpc.SupportPackageIsVersion3
 // Client API for ConduitAgent service
 
 type ConduitAgentClient interface {
-	Pull(ctx context.Context, in *Token, opts ...grpc.CallOption) (ConduitAgent_PullClient, error)
+	Pull(ctx context.Context, opts ...grpc.CallOption) (ConduitAgent_PullClient, error)
 }
 
 type conduitAgentClient struct {
@@ -106,28 +106,27 @@ func NewConduitAgentClient(cc *grpc.ClientConn) ConduitAgentClient {
 	return &conduitAgentClient{cc}
 }
 
-func (c *conduitAgentClient) Pull(ctx context.Context, in *Token, opts ...grpc.CallOption) (ConduitAgent_PullClient, error) {
+func (c *conduitAgentClient) Pull(ctx context.Context, opts ...grpc.CallOption) (ConduitAgent_PullClient, error) {
 	stream, err := grpc.NewClientStream(ctx, &_ConduitAgent_serviceDesc.Streams[0], c.cc, "/main.ConduitAgent/Pull", opts...)
 	if err != nil {
 		return nil, err
 	}
 	x := &conduitAgentPullClient{stream}
-	if err := x.ClientStream.SendMsg(in); err != nil {
-		return nil, err
-	}
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
 	return x, nil
 }
 
 type ConduitAgent_PullClient interface {
+	Send(*Packet) error
 	Recv() (*Packet, error)
 	grpc.ClientStream
 }
 
 type conduitAgentPullClient struct {
 	grpc.ClientStream
+}
+
+func (x *conduitAgentPullClient) Send(m *Packet) error {
+	return x.ClientStream.SendMsg(m)
 }
 
 func (x *conduitAgentPullClient) Recv() (*Packet, error) {
@@ -141,7 +140,7 @@ func (x *conduitAgentPullClient) Recv() (*Packet, error) {
 // Server API for ConduitAgent service
 
 type ConduitAgentServer interface {
-	Pull(*Token, ConduitAgent_PullServer) error
+	Pull(ConduitAgent_PullServer) error
 }
 
 func RegisterConduitAgentServer(s *grpc.Server, srv ConduitAgentServer) {
@@ -149,15 +148,12 @@ func RegisterConduitAgentServer(s *grpc.Server, srv ConduitAgentServer) {
 }
 
 func _ConduitAgent_Pull_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(Token)
-	if err := stream.RecvMsg(m); err != nil {
-		return err
-	}
-	return srv.(ConduitAgentServer).Pull(m, &conduitAgentPullServer{stream})
+	return srv.(ConduitAgentServer).Pull(&conduitAgentPullServer{stream})
 }
 
 type ConduitAgent_PullServer interface {
 	Send(*Packet) error
+	Recv() (*Packet, error)
 	grpc.ServerStream
 }
 
@@ -169,6 +165,14 @@ func (x *conduitAgentPullServer) Send(m *Packet) error {
 	return x.ServerStream.SendMsg(m)
 }
 
+func (x *conduitAgentPullServer) Recv() (*Packet, error) {
+	m := new(Packet)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 var _ConduitAgent_serviceDesc = grpc.ServiceDesc{
 	ServiceName: "main.ConduitAgent",
 	HandlerType: (*ConduitAgentServer)(nil),
@@ -178,6 +182,7 @@ var _ConduitAgent_serviceDesc = grpc.ServiceDesc{
 			StreamName:    "Pull",
 			Handler:       _ConduitAgent_Pull_Handler,
 			ServerStreams: true,
+			ClientStreams: true,
 		},
 	},
 	Metadata: fileDescriptor0,
@@ -208,7 +213,7 @@ func (c *conduitServerClient) Push(ctx context.Context, opts ...grpc.CallOption)
 
 type ConduitServer_PushClient interface {
 	Send(*Packet) error
-	CloseAndRecv() (*Token, error)
+	Recv() (*Packet, error)
 	grpc.ClientStream
 }
 
@@ -220,11 +225,8 @@ func (x *conduitServerPushClient) Send(m *Packet) error {
 	return x.ClientStream.SendMsg(m)
 }
 
-func (x *conduitServerPushClient) CloseAndRecv() (*Token, error) {
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
-	m := new(Token)
+func (x *conduitServerPushClient) Recv() (*Packet, error) {
+	m := new(Packet)
 	if err := x.ClientStream.RecvMsg(m); err != nil {
 		return nil, err
 	}
@@ -246,7 +248,7 @@ func _ConduitServer_Push_Handler(srv interface{}, stream grpc.ServerStream) erro
 }
 
 type ConduitServer_PushServer interface {
-	SendAndClose(*Token) error
+	Send(*Packet) error
 	Recv() (*Packet, error)
 	grpc.ServerStream
 }
@@ -255,7 +257,7 @@ type conduitServerPushServer struct {
 	grpc.ServerStream
 }
 
-func (x *conduitServerPushServer) SendAndClose(m *Token) error {
+func (x *conduitServerPushServer) Send(m *Packet) error {
 	return x.ServerStream.SendMsg(m)
 }
 
@@ -275,6 +277,7 @@ var _ConduitServer_serviceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "Push",
 			Handler:       _ConduitServer_Push_Handler,
+			ServerStreams: true,
 			ClientStreams: true,
 		},
 	},
@@ -284,20 +287,20 @@ var _ConduitServer_serviceDesc = grpc.ServiceDesc{
 func init() { proto.RegisterFile("packet.proto", fileDescriptor0) }
 
 var fileDescriptor0 = []byte{
-	// 235 bytes of a gzipped FileDescriptorProto
+	// 228 bytes of a gzipped FileDescriptorProto
 	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x09, 0x6e, 0x88, 0x02, 0xff, 0xe2, 0xe2, 0x29, 0x48, 0x4c, 0xce,
 	0x4e, 0x2d, 0xd1, 0x2b, 0x28, 0xca, 0x2f, 0xc9, 0x17, 0x62, 0xc9, 0x4d, 0xcc, 0xcc, 0x53, 0x92,
 	0xe7, 0x62, 0x0d, 0xc9, 0xcf, 0x4e, 0xcd, 0x13, 0x12, 0xe3, 0x62, 0x4b, 0xc9, 0x07, 0x09, 0x49,
 	0x30, 0x2a, 0x30, 0x6a, 0x70, 0x06, 0x41, 0x79, 0x4a, 0xed, 0x8c, 0x5c, 0x6c, 0x01, 0x60, 0x7d,
 	0x42, 0xea, 0x5c, 0x4c, 0x99, 0x29, 0x60, 0x69, 0x3e, 0x23, 0x71, 0x3d, 0x90, 0xac, 0x1e, 0x44,
 	0x06, 0x4a, 0x85, 0x54, 0x16, 0xa4, 0x06, 0x01, 0x95, 0x08, 0x09, 0x70, 0x31, 0xe7, 0x16, 0xa7,
-	0x4b, 0x30, 0x81, 0x0d, 0x02, 0x31, 0x41, 0xa6, 0x17, 0xe7, 0x97, 0x16, 0x25, 0xa7, 0x4a, 0x30,
-	0x43, 0x4c, 0x87, 0xf0, 0x94, 0xb4, 0xb8, 0xb8, 0x10, 0x7a, 0x85, 0xd8, 0xb9, 0x98, 0x7d, 0xfc,
-	0xdd, 0x05, 0x18, 0x84, 0x38, 0xb9, 0x58, 0x5d, 0xc3, 0x5c, 0xfd, 0x42, 0x04, 0x18, 0x85, 0x38,
-	0xb8, 0x58, 0x02, 0x5c, 0x83, 0xdc, 0x04, 0x98, 0x8c, 0x4c, 0xb9, 0x78, 0x9c, 0xf3, 0xf3, 0x52,
-	0x4a, 0x33, 0x4b, 0x1c, 0xd3, 0x53, 0xf3, 0x4a, 0x84, 0x54, 0x81, 0x32, 0xa5, 0x39, 0x39, 0x42,
-	0xdc, 0x10, 0xa7, 0x80, 0xbd, 0x21, 0xc5, 0x83, 0xec, 0x2e, 0x25, 0x06, 0x03, 0x46, 0x23, 0x33,
-	0x2e, 0x5e, 0xa8, 0xb6, 0xe0, 0xd4, 0xa2, 0xb2, 0xd4, 0x22, 0x88, 0xbe, 0xe2, 0x0c, 0x21, 0x14,
-	0xa5, 0x52, 0xc8, 0xa6, 0x28, 0x31, 0x68, 0x30, 0x26, 0xb1, 0x81, 0x83, 0xc9, 0x18, 0x10, 0x00,
-	0x00, 0xff, 0xff, 0xce, 0x7a, 0x5d, 0x64, 0x36, 0x01, 0x00, 0x00,
+	0x4b, 0x30, 0x29, 0x30, 0x03, 0x0d, 0x02, 0x31, 0x41, 0xa6, 0x17, 0xe7, 0x97, 0x16, 0x25, 0xa7,
+	0x4a, 0x30, 0x43, 0x4c, 0x87, 0xf0, 0x94, 0xb4, 0xb8, 0xb8, 0x10, 0x7a, 0x85, 0xd8, 0xb9, 0x98,
+	0x7d, 0xfc, 0xdd, 0x05, 0x18, 0x84, 0x38, 0xb9, 0x58, 0x5d, 0xc3, 0x5c, 0xfd, 0x42, 0x04, 0x18,
+	0x85, 0x38, 0xb8, 0x58, 0x02, 0x5c, 0x83, 0xdc, 0x04, 0x98, 0x8c, 0x2c, 0xb8, 0x78, 0x9c, 0xf3,
+	0xf3, 0x52, 0x4a, 0x33, 0x4b, 0x1c, 0xd3, 0x53, 0xf3, 0x4a, 0x84, 0x34, 0x80, 0x32, 0xa5, 0x39,
+	0x39, 0x42, 0x3c, 0xc8, 0x4e, 0x91, 0x42, 0xe1, 0x29, 0x31, 0x68, 0x30, 0x1a, 0x30, 0x1a, 0x59,
+	0x72, 0xf1, 0x42, 0x75, 0x06, 0xa7, 0x16, 0x95, 0xa5, 0x16, 0x41, 0xb4, 0x16, 0x67, 0x10, 0xd6,
+	0x9a, 0xc4, 0x06, 0x0e, 0x2c, 0x63, 0x40, 0x00, 0x00, 0x00, 0xff, 0xff, 0x69, 0x4a, 0x36, 0xf0,
+	0x3c, 0x01, 0x00, 0x00,
 }
