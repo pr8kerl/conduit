@@ -22,6 +22,7 @@ import (
 	"github.com/mitchellh/cli"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/grpclog"
 	"io"
 	"os"
@@ -31,13 +32,13 @@ import (
 	"time"
 )
 
-type ServerCommand struct {
+type CollectorAwsCommand struct {
 	Port int
 	Ui   cli.Ui
 }
 
-func serverCmdFactory() (cli.Command, error) {
-	return &ServerCommand{
+func collectorAwsCmdFactory() (cli.Command, error) {
+	return &CollectorAwsCommand{
 		Ui: &cli.ColoredUi{
 			Ui:          ui,
 			OutputColor: cli.UiColorGreen,
@@ -48,21 +49,41 @@ func serverCmdFactory() (cli.Command, error) {
 type conduitAgentConnection struct {
 	addr     string
 	conn     *grpc.ClientConn
-	dopts    grpc.DialOption
+	dopts    []grpc.DialOption
 	shutdown chan bool
 }
 
-func newAgentConnection(hostname string, port int, shut chan bool) (c *conduitAgentConnection, err error) {
-	c = new(conduitAgentConnection)
+func (c *conduitCollecterAws) NewAgentConnection(hostname string, port int, shut chan bool) (a *conduitAgentConnection, err error) {
+	a = new(conduitAgentConnection)
 	portstr := fmt.Sprintf("%d", port)
-	c.addr = hostname + ":" + portstr
-	c.dopts = grpc.WithInsecure()
-	c.shutdown = shut
-	c.conn, err = grpc.Dial(c.addr, c.dopts)
+	a.addr = hostname + ":" + portstr
+
+	if c.config.UseTls {
+		var creds credentials.TransportCredentials
+		if c.config.CertName == "" {
+			err := fmt.Errorf("error: common certificate name is missing from the config, required when using tls.\n")
+			return nil, err
+		}
+		if c.config.TrustedCert != "" {
+			var err error
+			creds, err = credentials.NewClientTLSFromFile(c.config.TrustedCert, c.config.CertName)
+			if err != nil {
+				grpclog.Fatalf("Failed to create TLS credentials %v", err)
+			}
+		} else {
+			creds = credentials.NewClientTLSFromCert(nil, c.config.CertName)
+		}
+		a.dopts = append(a.dopts, grpc.WithTransportCredentials(creds))
+	} else {
+		a.dopts = append(a.dopts, grpc.WithInsecure())
+	}
+
+	a.shutdown = shut
+	a.conn, err = grpc.Dial(a.addr, a.dopts...)
 	if err != nil {
 		return nil, err
 	}
-	return c, nil
+	return a, nil
 }
 
 func (c *conduitAgentConnection) Poll() (err error) {
@@ -72,10 +93,10 @@ func (c *conduitAgentConnection) Poll() (err error) {
 		select {
 		case <-c.shutdown:
 			// shutdown signal
-			grpclog.Printf("server: poll shutdown\n")
+			grpclog.Printf("aws: poll shutdown\n")
 			return nil
 		case <-time.After(time.Minute):
-			grpclog.Printf("server: poll timeout\n")
+			grpclog.Printf("aws: poll timeout\n")
 			cagent := NewConduitAgentClient(c.conn)
 			stream, err := cagent.Pull(context.Background())
 			if err != nil {
@@ -103,23 +124,32 @@ func (c *conduitAgentConnection) Poll() (err error) {
 	}
 }
 
-type conduitServer struct {
+type conduitCollecterAws struct {
 	sigs     chan os.Signal
 	shutdown chan bool
 	incoming chan []byte
 	wait     sync.WaitGroup
-	conn     grpc.ClientConn
+	config   *AwsConfig
 }
 
-func newServer() *conduitServer {
-	s := new(conduitServer)
-	s.sigs = make(chan os.Signal, 1)
-	s.shutdown = make(chan bool, 1)
-	s.incoming = make(chan []byte, 1024)
-	return s
+func newCollector() (*conduitCollecterAws, error) {
+	c := new(conduitCollecterAws)
+	c.sigs = make(chan os.Signal, 1)
+	c.shutdown = make(chan bool, 1)
+	c.incoming = make(chan []byte, 1024)
+
+	var cfg *Config
+	cfg = &Config{}
+	err := getConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("error reading config: %s", err)
+	}
+	c.config = cfg.Aws
+
+	return c, nil
 }
 
-func (c *conduitServer) SigHandler() {
+func (c *conduitCollecterAws) SigHandler() {
 	defer c.wait.Done()
 	signal.Notify(c.sigs,
 		syscall.SIGTERM,
@@ -130,9 +160,9 @@ func (c *conduitServer) SigHandler() {
 	return
 }
 
-func (c *conduitServer) Stop() {
+func (c *conduitCollecterAws) Stop() {
 
-	c.conn.Close()
+	//c.conn.Close()
 	close(c.shutdown)
 	c.wait.Wait()
 
@@ -141,12 +171,12 @@ func (c *conduitServer) Stop() {
 	c.incoming = nil
 }
 
-func (c *ServerCommand) Run(args []string) int {
+func (c *CollectorAwsCommand) Run(args []string) int {
 
-	cmdFlags := flag.NewFlagSet("server", flag.ContinueOnError)
+	cmdFlags := flag.NewFlagSet("aws", flag.ContinueOnError)
 	cmdFlags.Usage = func() { c.Ui.Output(c.Help()) }
 
-	cmdFlags.IntVar(&c.Port, "port", 6666, "The port on which to run the console server")
+	cmdFlags.IntVar(&c.Port, "port", 6666, "The port on which to run the conduit collector")
 	if err := cmdFlags.Parse(args); err != nil {
 		return 1
 	}
@@ -157,28 +187,33 @@ func (c *ServerCommand) Run(args []string) int {
 
 	// pull channel
 
-	grpclog.Printf("starting server %s\n", version)
+	grpclog.Printf("starting conduit aws %s\n", version)
 
-	server := newServer()
-	conn, err := newAgentConnection("127.0.0.1", 6666, server.shutdown)
+	collector, err := newCollector()
+	if err != nil {
+		grpclog.Printf("error initialising aws collector: %s\n", err)
+		return 1
+	}
+
+	conn, err := collector.NewAgentConnection("127.0.0.1", 6666, collector.shutdown)
 	if err != nil {
 		grpclog.Printf("error connecting to agent: %s\n", err)
 		return 1
 	}
-	server.wait.Add(1)
-	go server.SigHandler()
+	collector.wait.Add(1)
+	go collector.SigHandler()
 	conn.Poll()
-	grpclog.Printf("server: Poll is finished\n")
-	server.Stop()
+	grpclog.Printf("aws: poll finished\n")
+	collector.Stop()
 
 	return 0
 
 }
 
-func (c *ServerCommand) Help() string {
-	return "Run as a server (detailed help information here)"
+func (c *CollectorAwsCommand) Help() string {
+	return "Run as a collector (detailed help information here)"
 }
 
-func (c *ServerCommand) Synopsis() string {
-	return "Run as a server"
+func (c *CollectorAwsCommand) Synopsis() string {
+	return "Run as a collector"
 }

@@ -22,12 +22,13 @@ import (
 	//	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	//	"log"
-	"net"
-	//	"google.golang.org/grpc/credentials"
 	"bufio"
 	"bytes"
 	"container/heap"
+	"fmt"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/grpclog"
+	"net"
 	"os"
 	"os/signal"
 	"sync"
@@ -83,18 +84,25 @@ type conduitAgentServer struct {
 	wait       sync.WaitGroup
 	conn       *net.UDPConn
 	addr       *net.UDPAddr
+	config     *AgentConfig
 }
 
-func newAgentServer() *conduitAgentServer {
+func newAgentServer() (*conduitAgentServer, error) {
 	a := new(conduitAgentServer)
 	a.msgmutex = &sync.Mutex{}
 	a.sigs = make(chan os.Signal, 1)
-	a.GrpcServer = grpc.NewServer()
 	a.shutdown = make(chan bool, 1)
 	a.incoming = make(chan []byte, 1024)
 	a.tgrafq = &TgrafQ{}
 	heap.Init(a.tgrafq)
-	return a
+	var cfg *Config
+	cfg = &Config{}
+	err := getConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("error reading config: %s", err)
+	}
+	a.config = cfg.Agent
+	return a, nil
 }
 
 func (c *conduitAgentServer) Pull(stream ConduitAgent_PullServer) error {
@@ -112,6 +120,10 @@ func (c *conduitAgentServer) Pull(stream ConduitAgent_PullServer) error {
 	}
 
 	return nil
+}
+
+func (c *conduitAgentServer) SetConfig(cfg *AgentConfig) {
+	c.config = cfg
 }
 
 func (c *conduitAgentServer) SigHandler() {
@@ -208,6 +220,28 @@ func (c *conduitAgentServer) parseTelegraf() {
 
 }
 
+func (c *conduitAgentServer) Serve() (err error) {
+
+	lsnr, err := net.Listen("tcp", agentAddr)
+	if err != nil {
+		return fmt.Errorf("error failed to bind agent: %v", err)
+	}
+
+	var opts []grpc.ServerOption
+	if c.config.UseTls {
+		creds, err := credentials.NewServerTLSFromFile(c.config.TlsCertificate, c.config.TlsKey)
+		if err != nil {
+			grpclog.Fatalf("failed to generate tls credentials %v", err)
+		}
+		opts = []grpc.ServerOption{grpc.Creds(creds)}
+	}
+
+	c.GrpcServer = grpc.NewServer(opts...)
+	RegisterConduitAgentServer(c.GrpcServer, c)
+	return c.GrpcServer.Serve(lsnr)
+
+}
+
 func (c *AgentCommand) Run(args []string) int {
 
 	cmdFlags := flag.NewFlagSet("agent", flag.ContinueOnError)
@@ -226,30 +260,18 @@ func (c *AgentCommand) Run(args []string) int {
 
 	grpclog.Printf("starting agent %s\n", version)
 
-	lsnr, err := net.Listen("tcp", agentAddr)
+	agent, err := newAgentServer()
 	if err != nil {
-		grpclog.Fatalf("failed to bind agent: %v", err)
+		grpclog.Fatalf("failed to instantiate agent: %v", err)
 	}
-
-	/*
-		var opts []grpc.ServerOption
-		if *tls {
-			creds, err := credentials.NewServerTLSFromFile(*certFile, *keyFile)
-			if err != nil {
-				grpclog.Fatalf("Failed to generate credentials %v", err)
-			}
-			opts = []grpc.ServerOption{grpc.Creds(creds)}
-		}
-		grpcServer := grpc.NewServer(opts...)
-	*/
-
-	agent := newAgentServer()
-	RegisterConduitAgentServer(agent.GrpcServer, agent)
 	agent.wait.Add(2)
 	go agent.SigHandler()
 	go agent.parseTelegraf()
 	go agent.ServeTelegraf()
-	agent.GrpcServer.Serve(lsnr)
+	err = agent.Serve()
+	if err != nil {
+		grpclog.Fatalf("error serving agent: %v", err)
+	}
 
 	return 0
 

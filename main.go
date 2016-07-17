@@ -43,8 +43,8 @@ func main() {
 	version = c.Version
 
 	c.Commands = map[string]cli.CommandFactory{
-		"server": serverCmdFactory,
-		"agent":  agentCmdFactory,
+		"aws":   collectorAwsCmdFactory,
+		"agent": agentCmdFactory,
 		//		"telegraf": telegrafCmdFactory,
 	}
 
